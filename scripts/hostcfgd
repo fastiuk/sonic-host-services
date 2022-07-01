@@ -12,6 +12,7 @@ import re
 import jinja2
 from sonic_py_common import device_info
 from swsscommon.swsscommon import ConfigDBConnector, DBConnector, Table
+from swsscommon import swsscommon
 
 # FILE
 PAM_AUTH_CONF = "/etc/pam.d/common-auth-sonic"
@@ -1253,6 +1254,79 @@ class PamLimitsCfg(object):
                     "modify pam_limits config file failed with exception: {}"
                     .format(e))
 
+class LoginCfg(object):
+    """
+    LoginCfg Config Daemon
+    Handles changes in LOGIN_MESSAGE table.
+    1) Handle change for pre-login and post-login messages.
+    """
+    class cmds:
+        """Run commands for actions"""
+        login_message_pre = '''sudo bash -c "echo -e{} '{}' > /etc/issue.net"'''
+        login_message_appl = "sudo sed -iE 's/\(#\|\)Banner.*$/Banner "\
+                            "\/etc\/issue.net/' /etc/ssh/sshd_config"
+        login_message_rest_ssh = "sudo service ssh restart"
+        login_message_post = '''sudo bash -c "echo -e{} '{}' > /etc/motd"'''
+
+    def __init__(self):
+        self.cache = {}
+
+    def load(self, login_msgs={}):
+        # Get initial login messages
+        self.cache['pre-login'] = login_msgs.get('pre-login',{}
+                                                ).get('message', '')
+        self.cache['post-login'] = login_msgs.get('post-login', {}
+                                                 ).get('message', '')
+        syslog.syslog(syslog.LOG_DEBUG, f'Initial login message: {self.cache}')
+
+    def set_login_message(self, key, data):
+        """
+        Apply login message handler.
+
+        Args:
+            cache: Cache to compare/save data.
+            db: DB instance.
+            table: DB table that was changed.
+            key: DB table's key that was triggered change.
+            data: Read table data.
+        """
+        # Handling pre/post login messages. Data should be a dict
+        msg = None if not isinstance(data, dict) else data.get('message')
+        if type(msg) != str:
+            # Nothing to handle
+            return
+
+        # Check with cache
+        if msg == self.cache.get(key):
+            # Nothing to handle
+            return
+
+        # Don't print newline when message is empty
+        not_newline = '' if msg else 'n'
+
+        try:
+            # Check which key was changed
+            if key == 'pre_login':
+                # Write pre-login to /etc/issue file
+                run_cmd(self.cmds.login_message_pre.format(not_newline, msg),
+                        True, True)
+                run_cmd(self.cmds.login_message_appl, log_err=True,
+                        raise_exception=True)
+                run_cmd(self.cmds.login_message_rest_ssh, log_err=True,
+                        raise_exception=True)
+            elif key == 'post_login':
+                # Write post-login to /etc/motd file
+                run_cmd(self.cmds.login_message_post.format(not_newline, msg),
+                        True, True)
+        except Exception:
+            syslog.syslog(syslog.LOG_ERR, f'Failed to update {key} message')
+            return
+
+        # Update cache
+        syslog.syslog(f'Set new {key} message: {msg}')
+        self.cache[key] = msg
+
+
 class HostConfigDaemon:
     def __init__(self):
         # Just a sanity check to verify if the CONFIG_DB has been initialized
@@ -1294,6 +1368,9 @@ class HostConfigDaemon:
         self.pamLimitsCfg = PamLimitsCfg(self.config_db)
         self.pamLimitsCfg.update_config_file()
 
+        # Initialize LoginCfg
+        self.loginmsgcfg = LoginCfg()
+
     def load(self, init_data):
         features = init_data['FEATURE']
         aaa = init_data['AAA']
@@ -1306,6 +1383,7 @@ class HostConfigDaemon:
         ntp_global = init_data['NTP']
         kdump = init_data['KDUMP']
         passwh = init_data['PASSW_HARDENING']
+        login_msgs = init_data.get(swsscommon.CFG_LOGIN_MESSAGE_TABLE_NAME, {})
 
         self.feature_handler.sync_state_field(features)
         self.aaacfg.load(aaa, tacacs_global, tacacs_server, radius_global, radius_server)
@@ -1313,6 +1391,7 @@ class HostConfigDaemon:
         self.ntpcfg.load(ntp_global, ntp_server)
         self.kdumpCfg.load(kdump)
         self.passwcfg.load(passwh)
+        self.loginmsgcfg.load(login_msgs)
 
         dev_meta = self.config_db.get_table('DEVICE_METADATA')
         if 'localhost' in dev_meta:
@@ -1321,6 +1400,12 @@ class HostConfigDaemon:
 
         # Update AAA with the hostname
         self.aaacfg.hostname_update(self.hostname_cache)
+
+        # Update Login messages
+        login_msgs = self.config_db.get_table(
+            swsscommon.CFG_LOGIN_MESSAGE_TABLE_NAME)
+        for key in login_msgs:
+            self.loginmsgcfg.set_login_message(key, login_msgs[key])
 
     def __get_intf_name(self, key):
         if isinstance(key, tuple) and key:
@@ -1409,6 +1494,10 @@ class HostConfigDaemon:
         syslog.syslog(syslog.LOG_INFO, 'Kdump handler...')
         self.kdumpCfg.kdump_update(key, data)
 
+    def login_handler(self, key, op, data):
+        syslog.syslog(syslog.LOG_INFO, 'LOGIN_MESSAGE table handler...')
+        self.loginmsgcfg.set_login_message(key, data)
+
     def wait_till_system_init_done(self):
         # No need to print the output in the log file so using the "--quiet"
         # flag
@@ -1447,7 +1536,11 @@ class HostConfigDaemon:
         self.config_db.subscribe('VLAN_SUB_INTERFACE', make_callback(self.vlan_sub_intf_handler))
         self.config_db.subscribe('PORTCHANNEL_INTERFACE', make_callback(self.portchannel_intf_handler))
         self.config_db.subscribe('INTERFACE', make_callback(self.phy_intf_handler))
-        
+
+        # Handle LOGIN_MESSAGE changes
+        self.config_db.subscribe(swsscommon.CFG_LOGIN_MESSAGE_TABLE_NAME,
+                                 make_callback(self.login_handler))
+
         syslog.syslog(syslog.LOG_INFO,
                       "Waiting for systemctl to finish initialization")
         self.wait_till_system_init_done()
